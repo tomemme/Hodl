@@ -15,6 +15,7 @@ Optional:
 
 import os
 import sys
+import json
 import hmac
 import time as time_mod
 import base64
@@ -22,7 +23,7 @@ import hashlib
 import urllib.parse
 from time import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Iterator, Tuple
 
 import httpx
 from notion_client import Client as NotionClient
@@ -33,6 +34,13 @@ try:
     load_dotenv()
 except Exception:
     pass
+
+
+# ------------------------------
+# General helpers
+# ------------------------------
+def normalize_pair_key(pair_text: str) -> str:
+    return "".join(ch for ch in pair_text.upper() if ch.isalnum())
 
 
 # ------------------------------
@@ -118,6 +126,27 @@ class KrakenClient:
             ofs += len(raw_trades)
         return trades
 
+    def asset_pairs(self) -> Dict[str, Any]:
+        url_path = f"{self.base_url}/0/public/AssetPairs"
+        r = self.http.get(url_path)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            raise RuntimeError(f"Kraken API error: {data['error']}")
+        return data.get("result", {})
+
+    def ticker(self, pairs: List[str]) -> Dict[str, Any]:
+        if not pairs:
+            return {}
+        url_path = f"{self.base_url}/0/public/Ticker"
+        params = {"pair": ",".join(pairs)}
+        r = self.http.get(url_path, params=params)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            raise RuntimeError(f"Kraken API error: {data['error']}")
+        return data.get("result", {})
+
 
 # ------------------------------
 # Notion helpers
@@ -126,6 +155,62 @@ class NotionLogger:
     def __init__(self, api_key: str, database_id: str):
         self.notion = NotionClient(auth=api_key)
         self.db_id = database_id
+        self._db_properties: Dict[str, Dict[str, Any]] = {}
+        self._load_db_schema()
+
+    def _load_db_schema(self) -> None:
+        try:
+            resp = self.notion.databases.retrieve(self.db_id)
+        except Exception as exc:
+            print(f"⚠️ Unable to load Notion database schema: {exc}")
+            self._db_properties = {}
+            return
+        props = resp.get("properties", {}) if isinstance(resp, dict) else {}
+        if isinstance(props, dict):
+            self._db_properties = props
+        else:
+            self._db_properties = {}
+
+    def _property_type(self, name: str) -> Optional[str]:
+        prop = self._db_properties.get(name)
+        if isinstance(prop, dict):
+            return prop.get("type")
+        return None
+
+    def _build_equals_filter(self, property_name: str, value: str) -> Optional[Dict[str, Any]]:
+        prop_type = self._property_type(property_name)
+        if not prop_type:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if prop_type in {"title", "rich_text"}:
+            return {"property": property_name, prop_type: {"equals": value}}
+        if prop_type == "select":
+            return {"property": property_name, "select": {"equals": value}}
+        if prop_type == "status":
+            return {"property": property_name, "status": {"equals": value}}
+        if prop_type == "multi_select":
+            return {"property": property_name, "multi_select": {"contains": value}}
+        if prop_type == "url":
+            return {"property": property_name, "url": {"equals": value}}
+        if prop_type == "number":
+            try:
+                num_value = float(value)
+            except ValueError:
+                return None
+            return {"property": property_name, "number": {"equals": num_value}}
+        return None
+
+    def _build_not_empty_filter(self, property_name: str) -> Optional[Dict[str, Any]]:
+        prop_type = self._property_type(property_name)
+        if not prop_type:
+            return None
+        if prop_type in {"title", "rich_text", "select", "multi_select", "status", "people", "files", "relation", "date", "url", "email", "phone_number"}:
+            return {"property": property_name, prop_type: {"is_not_empty": True}}
+        if prop_type == "number":
+            return {"property": property_name, "number": {"is_not_empty": True}}
+        return None
 
     def _find_existing_by_txid(self, txid: str) -> Optional[str]:
         # Filter on the Title property "TXID"
@@ -168,6 +253,177 @@ class NotionLogger:
             self.notion.pages.update(page_id=page_id, properties=props)
         else:
             self.notion.pages.create(parent={"database_id": self.db_id}, properties=props)
+
+    # ---- price helpers ----
+    def _extract_plain_text(self, prop: Optional[Dict[str, Any]]) -> str:
+        if not prop:
+            return ""
+        prop_type = prop.get("type")
+        if prop_type in {"title", "rich_text"}:
+            items = prop.get(prop_type, [])
+            if not isinstance(items, list):
+                return ""
+            return "".join(item.get("plain_text", "") for item in items)
+        if prop_type == "select":
+            sel = prop.get("select")
+            if isinstance(sel, dict):
+                return sel.get("name", "")
+        if prop_type == "multi_select":
+            sels = prop.get("multi_select", [])
+            if isinstance(sels, list):
+                return ",".join(sel.get("name", "") for sel in sels if isinstance(sel, dict))
+        if prop_type == "url":
+            return prop.get("url") or ""
+        if prop_type == "number":
+            number_val = prop.get("number")
+            return "" if number_val is None else str(number_val)
+        if prop_type == "formula":
+            formula = prop.get("formula", {})
+            if isinstance(formula, dict):
+                if formula.get("type") == "string":
+                    return formula.get("string", "")
+                if formula.get("type") == "number":
+                    number_val = formula.get("number")
+                    return "" if number_val is None else str(number_val)
+        return ""
+
+    def _title_property_name(self, properties: Dict[str, Any]) -> Optional[str]:
+        for name, prop in properties.items():
+            if isinstance(prop, dict) and prop.get("type") == "title":
+                return name
+        return None
+
+    def iter_price_rows(
+        self,
+        pair_property: str,
+        price_property: str,
+        exchange_property: Optional[str] = None,
+        exchange_value: Optional[str] = None,
+    ) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
+        cursor: Optional[str] = None
+        base_filters: List[Dict[str, Any]] = []
+        if exchange_property and exchange_value:
+            exch_filter = self._build_equals_filter(exchange_property, exchange_value)
+            if exch_filter:
+                base_filters.append(exch_filter)
+        pair_not_empty = self._build_not_empty_filter(pair_property)
+        if pair_not_empty:
+            base_filters.append(pair_not_empty)
+        while True:
+            query_payload: Dict[str, Any] = {
+                "database_id": self.db_id,
+                "start_cursor": cursor,
+                "page_size": 100,
+            }
+            if base_filters:
+                if len(base_filters) == 1:
+                    query_payload["filter"] = base_filters[0]
+                else:
+                    query_payload["filter"] = {"and": base_filters}
+            resp = self.notion.databases.query(
+                **query_payload
+            )
+            results = resp.get("results", [])
+            for page in results:
+                properties: Dict[str, Any] = page.get("properties", {})
+                if exchange_property and exchange_value:
+                    exch_prop = properties.get(exchange_property)
+                    exch_val = self._extract_plain_text(exch_prop)
+                    if exch_val.lower() != exchange_value.lower():
+                        continue
+                pair_prop = properties.get(pair_property)
+                pair_value = self._extract_plain_text(pair_prop)
+                if not pair_value:
+                    title_name = self._title_property_name(properties)
+                    if title_name:
+                        pair_value = self._extract_plain_text(properties.get(title_name))
+                if not pair_value:
+                    continue
+                if price_property not in properties:
+                    continue
+                yield page.get("id"), pair_value, properties
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+
+    def update_price(self, page_id: str, property_name: str, price: float) -> None:
+        self.notion.pages.update(
+            page_id=page_id,
+            properties={property_name: {"number": price}},
+        )
+
+
+# ------------------------------
+# Known pair helpers
+# ------------------------------
+DEFAULT_KNOWN_PAIRS = {
+    "BTC": "XBTUSD",
+    "BTCUSD": "XBTUSD",
+    "XBT": "XBTUSD",
+    "ETH": "ETHUSD",
+    "ETHUSD": "ETHUSD",
+    "ADA": "ADAUSD",
+    "ADAUSD": "ADAUSD",
+    "DOGE": "XDGUSD",
+    "DOGEUSD": "XDGUSD",
+    "XDG": "XDGUSD",
+    "DOT": "DOTUSD",
+    "DOTUSD": "DOTUSD",
+    "ATOM": "ATOMUSD",
+    "ATOMUSD": "ATOMUSD",
+    "SOL": "SOLUSD",
+    "SOLUSD": "SOLUSD",
+    "LINK": "LINKUSD",
+    "LINKUSD": "LINKUSD",
+    "MATIC": "MATICUSD",
+    "MATICUSD": "MATICUSD",
+    "POL": "MATICUSD",
+    "LTC": "LTCUSD",
+    "LTCUSD": "LTCUSD",
+    "BCH": "BCHUSD",
+    "BCHUSD": "BCHUSD",
+    "AVAX": "AVAXUSD",
+    "AVAXUSD": "AVAXUSD",
+    "EGLD": "EGLDUSD",
+    "EGLDUSD": "EGLDUSD",
+}
+
+
+def load_known_pairs(path_hint: Optional[str]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for key, value in DEFAULT_KNOWN_PAIRS.items():
+        normalized_key = normalize_pair_key(key)
+        if not normalized_key:
+            continue
+        mapping[normalized_key] = value
+
+    candidate_paths: List[str] = []
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if path_hint:
+        candidate_paths.append(path_hint)
+        if not os.path.isabs(path_hint):
+            candidate_paths.append(os.path.join(script_dir, path_hint))
+    else:
+        candidate_paths.append(os.path.join(script_dir, "known_pairs.json"))
+
+    for candidate in candidate_paths:
+        if not candidate:
+            continue
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            print(f"⚠️ Failed to load known pairs from {candidate}: {exc}")
+            continue
+        if isinstance(data, dict):
+            for key, value in data.items():
+                normalized_key = normalize_pair_key(str(key))
+                if not normalized_key:
+                    continue
+                mapping[normalized_key] = str(value)
+    return mapping
 
 
 # ------------------------------
@@ -230,8 +486,12 @@ def main():
     KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET", "").strip()
     NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "").strip()
     NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "").strip()
-    SKIP_PAIRS = {p.strip() for p in os.environ.get("KRAKEN_SKIP_PAIRS", "").split(",") if p.strip()}
+    SKIP_PAIRS = {p.strip().upper() for p in os.environ.get("KRAKEN_SKIP_PAIRS", "").split(",") if p.strip()}
     TZ = os.environ.get("TZ", "UTC")
+    NOTION_PAIR_PROPERTY = os.environ.get("NOTION_PAIR_PROPERTY", "Pair")
+    NOTION_PRICE_PROPERTY = os.environ.get("NOTION_PRICE_PROPERTY", "Curr Price")
+    NOTION_EXCHANGE_PROPERTY = os.environ.get("NOTION_EXCHANGE_PROPERTY", "") or None
+    NOTION_EXCHANGE_VALUE = os.environ.get("NOTION_EXCHANGE_VALUE", "") or None
 
     # sanity checks
     missing = [k for k, v in {
@@ -259,29 +519,135 @@ def main():
 
     print(f"📦 Kraken returned {len(trades)} trades")
 
-    if not trades:
-        print("ℹ️ No trades found in that window. Done.")
-        return
-
     notion = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
 
     added, updated = 0, 0
-    for t in trades:
-        if t.get("pair") in SKIP_PAIRS:
+    if not trades:
+        print("ℹ️ No trades found in that window.")
+    else:
+        for t in trades:
+            pair_name = (t.get("pair") or "").upper()
+            if pair_name in SKIP_PAIRS:
+                continue
+            try:
+                norm = normalize_kraken_trade(t, tz_name=TZ)
+                existing_id = notion._find_existing_by_txid(norm["txid"])
+                notion.upsert_trade(norm)
+                if existing_id:
+                    updated += 1
+                else:
+                    added += 1
+            except Exception as e:
+                print(f"⚠️ Failed to upsert trade {t.get('_txid')}: {e}")
+
+    if trades:
+        print(f"✅ Trade sync complete. Added: {added}, Updated: {updated}")
+
+    # ---- Price refresh ----
+    try:
+        asset_pairs = kraken.asset_pairs()
+    except Exception as e:
+        print(f"⚠️ Unable to fetch Kraken asset pairs: {e}")
+        return
+
+    pair_lookup: Dict[str, str] = {}
+    alt_lookup: Dict[str, Dict[str, Any]] = {}
+    for canonical_name, meta in asset_pairs.items():
+        if not isinstance(meta, dict):
+            continue
+        canonical_upper = canonical_name.upper()
+        pair_lookup[canonical_upper] = canonical_name
+        alt_lookup[canonical_name] = meta
+
+        altname = (meta.get("altname") or "").upper()
+        if altname:
+            pair_lookup[altname] = canonical_name
+        wsname = (meta.get("wsname") or "").upper().replace("/", "")
+        if wsname:
+            pair_lookup[wsname] = canonical_name
+        pairname = (meta.get("name") or "").upper()
+        if pairname:
+            pair_lookup[pairname] = canonical_name
+        base = (meta.get("base") or "").upper().lstrip("X")
+        quote = (meta.get("quote") or "").upper().lstrip("Z")
+        if base and quote:
+            pair_lookup[f"{base}{quote}"] = canonical_name
+
+    raw_known_pairs = load_known_pairs(os.environ.get("KNOWN_PAIRS_FILE"))
+    targets: List[Tuple[str, str, str, Dict[str, Any]]] = []
+    for page_id, pair_text, props in notion.iter_price_rows(
+        pair_property=NOTION_PAIR_PROPERTY,
+        price_property=NOTION_PRICE_PROPERTY,
+        exchange_property=NOTION_EXCHANGE_PROPERTY,
+        exchange_value=NOTION_EXCHANGE_VALUE,
+    ):
+        normalized_key = normalize_pair_key(pair_text)
+        canonical_pair = pair_lookup.get(normalized_key)
+        if not canonical_pair and normalized_key in raw_known_pairs:
+            mapped_value = raw_known_pairs[normalized_key]
+            canonical_pair = pair_lookup.get(normalize_pair_key(mapped_value))
+            if not canonical_pair:
+                canonical_pair = pair_lookup.get(mapped_value.upper())
+            if not canonical_pair and mapped_value.upper() in asset_pairs:
+                canonical_pair = mapped_value.upper()
+        if not canonical_pair:
+            print(f"⚠️ Skipping Notion page {page_id}: unknown pair '{pair_text}'")
+            continue
+        if SKIP_PAIRS and (
+            normalized_key in SKIP_PAIRS
+            or canonical_pair.upper() in SKIP_PAIRS
+            or (alt_lookup.get(canonical_pair, {}).get("altname", "").upper() in SKIP_PAIRS)
+        ):
+            continue
+        targets.append((page_id, canonical_pair, pair_text, props))
+
+    if not targets:
+        print("ℹ️ No Notion rows eligible for price update.")
+        return
+
+    unique_pairs = sorted({t[1] for t in targets})
+    try:
+        ticker_info = kraken.ticker(unique_pairs)
+    except Exception as e:
+        print(f"❌ Failed to fetch Kraken ticker data: {e}")
+        return
+
+    updated_prices = 0
+    for page_id, canonical_pair, display_pair, props in targets:
+        meta = alt_lookup.get(canonical_pair, {})
+        ticker_data = ticker_info.get(canonical_pair)
+        if not ticker_data and meta:
+            alt_key = meta.get("altname")
+            if alt_key:
+                ticker_data = ticker_info.get(alt_key)
+        if not ticker_data:
+            print(f"⚠️ No ticker data returned for pair '{display_pair}' ({canonical_pair})")
+            continue
+        close_info = ticker_data.get("c") or []
+        if not close_info:
+            print(f"⚠️ Missing close price for pair '{display_pair}' ({canonical_pair})")
             continue
         try:
-            norm = normalize_kraken_trade(t, tz_name=TZ)
-            # Upsert: we don’t know if it will update or create; do a quick check
-            existing_id = notion._find_existing_by_txid(norm["txid"])
-            notion.upsert_trade(norm)
-            if existing_id:
-                updated += 1
-            else:
-                added += 1
-        except Exception as e:
-            print(f"⚠️ Failed to upsert trade {t.get('_txid')}: {e}")
+            latest_price = float(close_info[0])
+        except (ValueError, TypeError):
+            print(f"⚠️ Invalid price data for pair '{display_pair}' ({canonical_pair})")
+            continue
 
-    print(f"✅ Done. Added: {added}, Updated: {updated}")
+        current_prop = props.get(NOTION_PRICE_PROPERTY, {})
+        current_value = current_prop.get("number") if isinstance(current_prop, dict) else None
+        if current_value is not None and abs(current_value - latest_price) < 1e-9:
+            continue
+        try:
+            notion.update_price(page_id, NOTION_PRICE_PROPERTY, latest_price)
+            updated_prices += 1
+            print(f"💰 Updated {display_pair} price to {latest_price}")
+        except Exception as e:
+            print(f"⚠️ Failed to update price for page {page_id}: {e}")
+
+    if updated_prices:
+        print(f"✅ Price refresh complete. Updated {updated_prices} rows.")
+    else:
+        print("ℹ️ Prices already up to date.")
 
 
 if __name__ == "__main__":
