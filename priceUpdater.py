@@ -157,7 +157,18 @@ class NotionLogger:
         self.notion = NotionClient(auth=api_key)
         self.db_id = database_id
         self._db_properties: Dict[str, Dict[str, Any]] = {}
-        self._load_db_schema()
+        self._schema_ready = threading.Event()
+        self._schema_error: Optional[Exception] = None
+        self._schema_warned = False
+        threading.Thread(target=self._warm_schema, daemon=True).start()
+
+    def _warm_schema(self) -> None:
+        try:
+            self._load_db_schema()
+        except Exception as exc:
+            self._schema_error = exc
+        finally:
+            self._schema_ready.set()
 
     def _load_db_schema(self) -> None:
         try:
@@ -172,7 +183,12 @@ class NotionLogger:
         else:
             self._db_properties = {}
 
+    def wait_for_schema(self, timeout: Optional[float] = None) -> bool:
+        return self._schema_ready.wait(timeout=timeout)
+
     def _property_type(self, name: str) -> Optional[str]:
+        if not self._schema_ready.is_set():
+            return None
         prop = self._db_properties.get(name)
         if isinstance(prop, dict):
             return prop.get("type")
@@ -303,6 +319,18 @@ class NotionLogger:
     ) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
         cursor: Optional[str] = None
         base_filters: List[Dict[str, Any]] = []
+        if not self._schema_ready.is_set():
+            # Give the schema loader a brief chance to finish before we fall back to client-side filtering.
+            self.wait_for_schema(timeout=0.1)
+        if not self._schema_ready.is_set() and not self._schema_warned:
+            if self._schema_error:
+                print(
+                    "⚠️ Proceeding without Notion schema filters due to load error: "
+                    f"{self._schema_error}"
+                )
+            else:
+                print("ℹ️ Notion schema still loading; continuing without server-side filters.")
+            self._schema_warned = True
         if exchange_property and exchange_value:
             exch_filter = self._build_equals_filter(exchange_property, exchange_value)
             if exch_filter:
