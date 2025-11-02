@@ -1,0 +1,16 @@
+{
+  "BTC": "XBTUSD",
+  "ETH": "ETHUSD",
+  "ADA": "ADAUSD",
+  "DOGE": "XDGUSD",
+  "DOT": "DOTUSD",
+  "ATOM": "ATOMUSD",
+  "SOL": "SOLUSD",
+  "LINK": "LINKUSD",
+  "MATIC": "MATICUSD",
+  "POL": "MATICUSD",
+  "LTC": "LTCUSD",
+  "BCH": "BCHUSD",
+  "AVAX": "AVAXUSD",
+  "EGLD": "EGLDUSD"
+}

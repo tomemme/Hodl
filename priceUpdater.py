@@ -15,6 +15,7 @@ Optional:
 
 import os
 import sys
+import json
 import hmac
 import time as time_mod
 import base64
@@ -33,6 +34,13 @@ try:
     load_dotenv()
 except Exception:
     pass
+
+
+# ------------------------------
+# General helpers
+# ------------------------------
+def normalize_pair_key(pair_text: str) -> str:
+    return "".join(ch for ch in pair_text.upper() if ch.isalnum())
 
 
 # ------------------------------
@@ -276,6 +284,79 @@ class NotionLogger:
 
 
 # ------------------------------
+# Known pair helpers
+# ------------------------------
+DEFAULT_KNOWN_PAIRS = {
+    "BTC": "XBTUSD",
+    "BTCUSD": "XBTUSD",
+    "XBT": "XBTUSD",
+    "ETH": "ETHUSD",
+    "ETHUSD": "ETHUSD",
+    "ADA": "ADAUSD",
+    "ADAUSD": "ADAUSD",
+    "DOGE": "XDGUSD",
+    "DOGEUSD": "XDGUSD",
+    "XDG": "XDGUSD",
+    "DOT": "DOTUSD",
+    "DOTUSD": "DOTUSD",
+    "ATOM": "ATOMUSD",
+    "ATOMUSD": "ATOMUSD",
+    "SOL": "SOLUSD",
+    "SOLUSD": "SOLUSD",
+    "LINK": "LINKUSD",
+    "LINKUSD": "LINKUSD",
+    "MATIC": "MATICUSD",
+    "MATICUSD": "MATICUSD",
+    "POL": "MATICUSD",
+    "LTC": "LTCUSD",
+    "LTCUSD": "LTCUSD",
+    "BCH": "BCHUSD",
+    "BCHUSD": "BCHUSD",
+    "AVAX": "AVAXUSD",
+    "AVAXUSD": "AVAXUSD",
+    "EGLD": "EGLDUSD",
+    "EGLDUSD": "EGLDUSD",
+}
+
+
+def load_known_pairs(path_hint: Optional[str]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for key, value in DEFAULT_KNOWN_PAIRS.items():
+        normalized_key = normalize_pair_key(key)
+        if not normalized_key:
+            continue
+        mapping[normalized_key] = value
+
+    candidate_paths: List[str] = []
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if path_hint:
+        candidate_paths.append(path_hint)
+        if not os.path.isabs(path_hint):
+            candidate_paths.append(os.path.join(script_dir, path_hint))
+    else:
+        candidate_paths.append(os.path.join(script_dir, "known_pairs.json"))
+
+    for candidate in candidate_paths:
+        if not candidate:
+            continue
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            print(f"⚠️ Failed to load known pairs from {candidate}: {exc}")
+            continue
+        if isinstance(data, dict):
+            for key, value in data.items():
+                normalized_key = normalize_pair_key(str(key))
+                if not normalized_key:
+                    continue
+                mapping[normalized_key] = str(value)
+    return mapping
+
+
+# ------------------------------
 # Normalization utilities
 # ------------------------------
 def normalize_kraken_trade(t: Dict[str, Any], tz_name: str = "UTC") -> Dict[str, Any]:
@@ -422,9 +503,7 @@ def main():
         if base and quote:
             pair_lookup[f"{base}{quote}"] = canonical_name
 
-    def normalize_pair_key(pair_text: str) -> str:
-        return "".join(ch for ch in pair_text.upper() if ch.isalnum())
-
+    raw_known_pairs = load_known_pairs(os.environ.get("KNOWN_PAIRS_FILE"))
     targets: List[Tuple[str, str, str, Dict[str, Any]]] = []
     for page_id, pair_text, props in notion.iter_price_rows(
         pair_property=NOTION_PAIR_PROPERTY,
@@ -434,6 +513,13 @@ def main():
     ):
         normalized_key = normalize_pair_key(pair_text)
         canonical_pair = pair_lookup.get(normalized_key)
+        if not canonical_pair and normalized_key in raw_known_pairs:
+            mapped_value = raw_known_pairs[normalized_key]
+            canonical_pair = pair_lookup.get(normalize_pair_key(mapped_value))
+            if not canonical_pair:
+                canonical_pair = pair_lookup.get(mapped_value.upper())
+            if not canonical_pair and mapped_value.upper() in asset_pairs:
+                canonical_pair = mapped_value.upper()
         if not canonical_pair:
             print(f"⚠️ Skipping Notion page {page_id}: unknown pair '{pair_text}'")
             continue
