@@ -522,6 +522,17 @@ def main():
     notion_instance: Optional[NotionLogger] = None
     notion_error: Optional[Exception] = None
     notion_ready = threading.Event()
+    last_checkpoint = time_mod.perf_counter()
+
+    def reset_checkpoint() -> None:
+        nonlocal last_checkpoint
+        last_checkpoint = time_mod.perf_counter()
+
+    def log_elapsed(label: str) -> None:
+        nonlocal last_checkpoint
+        now = time_mod.perf_counter()
+        print(f"⏱️ {label} (+{now - last_checkpoint:.2f}s)")
+        last_checkpoint = now
 
     def _init_notion_background() -> None:
         nonlocal notion_instance, notion_error
@@ -555,12 +566,15 @@ def main():
         sys.exit(2)
 
     print(f"📦 Kraken returned {len(trades)} trades")
+    reset_checkpoint()
 
     added, updated = 0, 0
     if not trades:
         print("ℹ️ No trades found in that window.")
+        reset_checkpoint()
     else:
         notion = get_notion()
+        log_elapsed("Notion client ready for trade sync")
         for t in trades:
             pair_name = (t.get("pair") or "").upper()
             if pair_name in SKIP_PAIRS:
@@ -577,16 +591,20 @@ def main():
                 print(f"⚠️ Failed to upsert trade {t.get('_txid')}: {e}")
 
     if trades:
+        log_elapsed("Trade sync complete")
         print(f"✅ Trade sync complete. Added: {added}, Updated: {updated}")
+        reset_checkpoint()
 
     # ---- Price refresh ----
     notion = get_notion()
+    log_elapsed("Notion client ready for price refresh")
 
     try:
         asset_pairs = kraken.asset_pairs()
     except Exception as e:
         print(f"⚠️ Unable to fetch Kraken asset pairs: {e}")
         return
+    log_elapsed("Fetched Kraken asset pairs")
 
     pair_lookup: Dict[str, str] = {}
     alt_lookup: Dict[str, Dict[str, Any]] = {}
@@ -615,6 +633,7 @@ def main():
     if skip_from_config:
         SKIP_PAIRS.update(skip_from_config)
     targets: List[Tuple[str, str, str, Dict[str, Any]]] = []
+    reset_checkpoint()
     for page_id, pair_text, props in notion.iter_price_rows(
         pair_property=NOTION_PAIR_PROPERTY,
         price_property=NOTION_PRICE_PROPERTY,
@@ -664,19 +683,23 @@ def main():
         ):
             continue
         targets.append((page_id, canonical_pair, pair_text, props))
+    log_elapsed("Loaded Notion price rows")
 
     if not targets:
         print("ℹ️ No Notion rows eligible for price update.")
         return
 
     unique_pairs = sorted({t[1] for t in targets})
+    reset_checkpoint()
     try:
         ticker_info = kraken.ticker(unique_pairs)
     except Exception as e:
         print(f"❌ Failed to fetch Kraken ticker data: {e}")
         return
+    log_elapsed("Fetched Kraken ticker data")
 
     updated_prices = 0
+    reset_checkpoint()
     for page_id, canonical_pair, display_pair, props in targets:
         meta = alt_lookup.get(canonical_pair, {})
         ticker_data = ticker_info.get(canonical_pair)
@@ -709,6 +732,7 @@ def main():
             print(f"⚠️ Failed to update price for page {page_id}: {e}")
 
     if updated_prices:
+        log_elapsed("Applied price updates")
         print(f"✅ Price refresh complete. Updated {updated_prices} rows.")
     else:
         print("ℹ️ Prices already up to date.")
