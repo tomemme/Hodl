@@ -529,12 +529,13 @@ def main():
 
     print(f"📦 Kraken returned {len(trades)} trades")
 
-    notion = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+    notion: Optional[NotionLogger] = None
 
     added, updated = 0, 0
     if not trades:
         print("ℹ️ No trades found in that window.")
     else:
+        notion = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
         for t in trades:
             pair_name = (t.get("pair") or "").upper()
             if pair_name in SKIP_PAIRS:
@@ -554,6 +555,9 @@ def main():
         print(f"✅ Trade sync complete. Added: {added}, Updated: {updated}")
 
     # ---- Price refresh ----
+    if notion is None:
+        notion = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+
     try:
         asset_pairs = kraken.asset_pairs()
     except Exception as e:
