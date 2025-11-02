@@ -20,6 +20,7 @@ import hmac
 import time as time_mod
 import base64
 import hashlib
+import threading
 import urllib.parse
 from time import time
 from datetime import datetime, timezone
@@ -518,6 +519,32 @@ def main():
     start_ts = get_days_lookback()
     end_ts = int(time())
 
+    notion_instance: Optional[NotionLogger] = None
+    notion_error: Optional[Exception] = None
+    notion_ready = threading.Event()
+
+    def _init_notion_background() -> None:
+        nonlocal notion_instance, notion_error
+        try:
+            notion_instance = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+        except Exception as exc:
+            notion_error = exc
+        finally:
+            notion_ready.set()
+
+    threading.Thread(target=_init_notion_background, daemon=True).start()
+
+    def get_notion() -> NotionLogger:
+        nonlocal notion_instance, notion_error
+        notion_ready.wait()
+        if notion_instance is not None:
+            return notion_instance
+        if notion_error is not None:
+            print(f"⚠️ Background Notion init failed: {notion_error}. Retrying synchronously...")
+            notion_error = None
+        notion_instance = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+        return notion_instance
+
     print("🔄 Fetching recent trades from Kraken...")
     kraken = KrakenClient(KRAKEN_API_KEY, KRAKEN_API_SECRET)
 
@@ -529,13 +556,11 @@ def main():
 
     print(f"📦 Kraken returned {len(trades)} trades")
 
-    notion: Optional[NotionLogger] = None
-
     added, updated = 0, 0
     if not trades:
         print("ℹ️ No trades found in that window.")
     else:
-        notion = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+        notion = get_notion()
         for t in trades:
             pair_name = (t.get("pair") or "").upper()
             if pair_name in SKIP_PAIRS:
@@ -555,8 +580,7 @@ def main():
         print(f"✅ Trade sync complete. Added: {added}, Updated: {updated}")
 
     # ---- Price refresh ----
-    if notion is None:
-        notion = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+    notion = get_notion()
 
     try:
         asset_pairs = kraken.asset_pairs()
