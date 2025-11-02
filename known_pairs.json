@@ -13,7 +13,8 @@
   "BCH": "BCHUSD",
   "AVAX": "AVAXUSD",
   "EGLD": "EGLDUSD",
-  "MBTN": "MBTNUSD",
+  "MBTN": null,
+  "MBTQ": null,
   "COQ": "COQUSD",
-  "MSTR": "MSTRUSD"
+  "MSTR": null
 }

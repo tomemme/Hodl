@@ -23,7 +23,7 @@ import hashlib
 import urllib.parse
 from time import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Iterator, Tuple
+from typing import Dict, Any, List, Optional, Iterator, Tuple, Set
 
 import httpx
 from notion_client import Client as NotionClient
@@ -389,8 +389,9 @@ DEFAULT_KNOWN_PAIRS = {
 }
 
 
-def load_known_pairs(path_hint: Optional[str]) -> Dict[str, str]:
+def load_known_pairs(path_hint: Optional[str]) -> Tuple[Dict[str, str], Set[str]]:
     mapping: Dict[str, str] = {}
+    skip: Set[str] = set()
     for key, value in DEFAULT_KNOWN_PAIRS.items():
         normalized_key = normalize_pair_key(key)
         if not normalized_key:
@@ -422,8 +423,17 @@ def load_known_pairs(path_hint: Optional[str]) -> Dict[str, str]:
                 normalized_key = normalize_pair_key(str(key))
                 if not normalized_key:
                     continue
-                mapping[normalized_key] = str(value)
-    return mapping
+                if isinstance(value, str):
+                    mapped_value = value.strip()
+                    if not mapped_value or mapped_value.upper() == "SKIP":
+                        skip.add(normalized_key)
+                    else:
+                        mapping[normalized_key] = mapped_value
+                elif value is None or value is False:
+                    skip.add(normalized_key)
+                else:
+                    mapping[normalized_key] = str(value)
+    return mapping, skip
 
 
 # ------------------------------
@@ -573,7 +583,9 @@ def main():
         if base and quote:
             pair_lookup[f"{base}{quote}"] = canonical_name
 
-    raw_known_pairs = load_known_pairs(os.environ.get("KNOWN_PAIRS_FILE"))
+    raw_known_pairs, skip_from_config = load_known_pairs(os.environ.get("KNOWN_PAIRS_FILE"))
+    if skip_from_config:
+        SKIP_PAIRS.update(skip_from_config)
     targets: List[Tuple[str, str, str, Dict[str, Any]]] = []
     for page_id, pair_text, props in notion.iter_price_rows(
         pair_property=NOTION_PAIR_PROPERTY,
@@ -582,6 +594,8 @@ def main():
         exchange_value=NOTION_EXCHANGE_VALUE,
     ):
         normalized_key = normalize_pair_key(pair_text)
+        if normalized_key in skip_from_config:
+            continue
         canonical_pair = pair_lookup.get(normalized_key)
         if not canonical_pair and normalized_key in raw_known_pairs:
             mapped_value = raw_known_pairs[normalized_key]
