@@ -591,7 +591,29 @@ def main():
             if not canonical_pair and mapped_value.upper() in asset_pairs:
                 canonical_pair = mapped_value.upper()
         if not canonical_pair:
-            print(f"⚠️ Skipping Notion page {page_id}: unknown pair '{pair_text}'")
+            mapped_value = raw_known_pairs.get(normalized_key)
+            similar_pairs: List[str] = []
+            for canonical, meta in asset_pairs.items():
+                canonical_upper = canonical.upper()
+                if normalized_key in canonical_upper:
+                    similar_pairs.append(canonical)
+                    continue
+                if isinstance(meta, dict):
+                    altname = (meta.get("altname") or "").upper()
+                    if altname and normalized_key in altname:
+                        similar_pairs.append(canonical)
+                        continue
+                    wsname = (meta.get("wsname") or "").upper().replace("/", "")
+                    if wsname and normalized_key in wsname:
+                        similar_pairs.append(canonical)
+                        continue
+            similar_display = ", ".join(sorted(set(similar_pairs))) or "<none>"
+            mapped_display = f", mapped='{mapped_value}'" if mapped_value else ""
+            print(
+                "⚠️ Skipping Notion page "
+                f"{page_id}: unknown pair '{pair_text}' (normalized='{normalized_key}'{mapped_display}). "
+                f"Closest Kraken matches: {similar_display}"
+            )
             continue
         if SKIP_PAIRS and (
             normalized_key in SKIP_PAIRS

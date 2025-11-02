@@ -12,5 +12,8 @@
   "LTC": "LTCUSD",
   "BCH": "BCHUSD",
   "AVAX": "AVAXUSD",
-  "EGLD": "EGLDUSD"
+  "EGLD": "EGLDUSD",
+  "MBTN": "MBTNUSD",
+  "COQ": "COQUSD",
+  "MSTR": "MSTRUSD"
 }
