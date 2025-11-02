@@ -153,13 +153,26 @@ class KrakenClient:
 # Notion helpers
 # ------------------------------
 class NotionLogger:
-    def __init__(self, api_key: str, database_id: str):
+    def __init__(
+        self,
+        api_key: str,
+        database_id: str,
+        property_overrides: Optional[Dict[str, str]] = None,
+    ):
         self.notion = NotionClient(auth=api_key)
         self.db_id = database_id
         self._db_properties: Dict[str, Dict[str, Any]] = {}
         self._schema_ready = threading.Event()
         self._schema_error: Optional[Exception] = None
         self._schema_warned = False
+        self._property_overrides: Dict[str, str] = {}
+        if property_overrides:
+            for name, value in property_overrides.items():
+                normalized_name = (name or "").strip()
+                normalized_value = (value or "").strip().lower()
+                if normalized_name and normalized_value:
+                    self._property_overrides[normalized_name] = normalized_value
+        self._override_mismatches_reported: Set[str] = set()
         threading.Thread(target=self._warm_schema, daemon=True).start()
 
     def _warm_schema(self) -> None:
@@ -187,6 +200,21 @@ class NotionLogger:
         return self._schema_ready.wait(timeout=timeout)
 
     def _property_type(self, name: str) -> Optional[str]:
+        override = self._property_overrides.get(name)
+        if override:
+            if self._schema_ready.is_set():
+                prop = self._db_properties.get(name)
+                actual_type = prop.get("type") if isinstance(prop, dict) else None
+                if actual_type and actual_type != override and name not in self._override_mismatches_reported:
+                    print(
+                        "⚠️ Notion schema reports property '"
+                        f"{name}' as type '{actual_type}', overriding requested '{override}'."
+                        " Using schema type."
+                    )
+                    self._override_mismatches_reported.add(name)
+                    self._property_overrides[name] = actual_type
+                    return actual_type
+            return override
         if not self._schema_ready.is_set():
             return None
         prop = self._db_properties.get(name)
@@ -318,7 +346,20 @@ class NotionLogger:
         exchange_value: Optional[str] = None,
     ) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
         cursor: Optional[str] = None
-        base_filters: List[Dict[str, Any]] = []
+        filters_disabled = False
+
+        def build_filters() -> List[Dict[str, Any]]:
+            filters: List[Dict[str, Any]] = []
+            if exchange_property and exchange_value:
+                exch_filter = self._build_equals_filter(exchange_property, exchange_value)
+                if exch_filter:
+                    filters.append(exch_filter)
+            pair_not_empty = self._build_not_empty_filter(pair_property)
+            if pair_not_empty:
+                filters.append(pair_not_empty)
+            return filters
+
+        base_filters: List[Dict[str, Any]] = build_filters()
         if not self._schema_ready.is_set():
             # Give the schema loader a brief chance to finish before we fall back to client-side filtering.
             self.wait_for_schema(timeout=0.1)
@@ -331,27 +372,42 @@ class NotionLogger:
             else:
                 print("ℹ️ Notion schema still loading; continuing without server-side filters.")
             self._schema_warned = True
-        if exchange_property and exchange_value:
-            exch_filter = self._build_equals_filter(exchange_property, exchange_value)
-            if exch_filter:
-                base_filters.append(exch_filter)
-        pair_not_empty = self._build_not_empty_filter(pair_property)
-        if pair_not_empty:
-            base_filters.append(pair_not_empty)
         while True:
             query_payload: Dict[str, Any] = {
                 "database_id": self.db_id,
                 "start_cursor": cursor,
                 "page_size": 100,
             }
-            if base_filters:
+            if base_filters and not filters_disabled:
                 if len(base_filters) == 1:
                     query_payload["filter"] = base_filters[0]
                 else:
                     query_payload["filter"] = {"and": base_filters}
-            resp = self.notion.databases.query(
-                **query_payload
-            )
+            try:
+                resp = self.notion.databases.query(
+                    **query_payload
+                )
+            except Exception as exc:
+                if base_filters and not filters_disabled:
+                    fallback_applied = False
+                    for name, override in list(self._property_overrides.items()):
+                        if name == pair_property and override == "rich_text":
+                            self._property_overrides[name] = "title"
+                            fallback_applied = True
+                        elif name == exchange_property and override == "select":
+                            self._property_overrides[name] = "multi_select"
+                            fallback_applied = True
+                    if fallback_applied:
+                        base_filters = build_filters()
+                        cursor = None
+                        continue
+                    print(
+                        f"⚠️ Notion rejected server-side filters ({exc}); falling back to client-side filtering."
+                    )
+                    filters_disabled = True
+                    cursor = None
+                    continue
+                raise
             results = resp.get("results", [])
             for page in results:
                 properties: Dict[str, Any] = page.get("properties", {})
@@ -531,6 +587,8 @@ def main():
     NOTION_PRICE_PROPERTY = os.environ.get("NOTION_PRICE_PROPERTY", "Curr Price")
     NOTION_EXCHANGE_PROPERTY = os.environ.get("NOTION_EXCHANGE_PROPERTY", "") or None
     NOTION_EXCHANGE_VALUE = os.environ.get("NOTION_EXCHANGE_VALUE", "") or None
+    NOTION_PAIR_PROPERTY_TYPE = os.environ.get("NOTION_PAIR_PROPERTY_TYPE", "") or None
+    NOTION_EXCHANGE_PROPERTY_TYPE = os.environ.get("NOTION_EXCHANGE_PROPERTY_TYPE", "") or None
 
     # sanity checks
     missing = [k for k, v in {
@@ -562,10 +620,25 @@ def main():
         print(f"⏱️ {label} (+{now - last_checkpoint:.2f}s)")
         last_checkpoint = now
 
+    property_overrides: Dict[str, str] = {}
+    if NOTION_PAIR_PROPERTY_TYPE:
+        property_overrides[NOTION_PAIR_PROPERTY] = NOTION_PAIR_PROPERTY_TYPE
+    elif NOTION_PAIR_PROPERTY:
+        property_overrides[NOTION_PAIR_PROPERTY] = "rich_text"
+    if NOTION_EXCHANGE_PROPERTY:
+        if NOTION_EXCHANGE_PROPERTY_TYPE:
+            property_overrides[NOTION_EXCHANGE_PROPERTY] = NOTION_EXCHANGE_PROPERTY_TYPE
+        else:
+            property_overrides[NOTION_EXCHANGE_PROPERTY] = "select"
+
     def _init_notion_background() -> None:
         nonlocal notion_instance, notion_error
         try:
-            notion_instance = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+            notion_instance = NotionLogger(
+                NOTION_API_KEY,
+                NOTION_DB_ID,
+                property_overrides=property_overrides,
+            )
         except Exception as exc:
             notion_error = exc
         finally:
@@ -581,7 +654,11 @@ def main():
         if notion_error is not None:
             print(f"⚠️ Background Notion init failed: {notion_error}. Retrying synchronously...")
             notion_error = None
-        notion_instance = NotionLogger(NOTION_API_KEY, NOTION_DB_ID)
+        notion_instance = NotionLogger(
+            NOTION_API_KEY,
+            NOTION_DB_ID,
+            property_overrides=property_overrides,
+        )
         return notion_instance
 
     print("🔄 Fetching recent trades from Kraken...")
