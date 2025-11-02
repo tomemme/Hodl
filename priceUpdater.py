@@ -155,6 +155,62 @@ class NotionLogger:
     def __init__(self, api_key: str, database_id: str):
         self.notion = NotionClient(auth=api_key)
         self.db_id = database_id
+        self._db_properties: Dict[str, Dict[str, Any]] = {}
+        self._load_db_schema()
+
+    def _load_db_schema(self) -> None:
+        try:
+            resp = self.notion.databases.retrieve(self.db_id)
+        except Exception as exc:
+            print(f"⚠️ Unable to load Notion database schema: {exc}")
+            self._db_properties = {}
+            return
+        props = resp.get("properties", {}) if isinstance(resp, dict) else {}
+        if isinstance(props, dict):
+            self._db_properties = props
+        else:
+            self._db_properties = {}
+
+    def _property_type(self, name: str) -> Optional[str]:
+        prop = self._db_properties.get(name)
+        if isinstance(prop, dict):
+            return prop.get("type")
+        return None
+
+    def _build_equals_filter(self, property_name: str, value: str) -> Optional[Dict[str, Any]]:
+        prop_type = self._property_type(property_name)
+        if not prop_type:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if prop_type in {"title", "rich_text"}:
+            return {"property": property_name, prop_type: {"equals": value}}
+        if prop_type == "select":
+            return {"property": property_name, "select": {"equals": value}}
+        if prop_type == "status":
+            return {"property": property_name, "status": {"equals": value}}
+        if prop_type == "multi_select":
+            return {"property": property_name, "multi_select": {"contains": value}}
+        if prop_type == "url":
+            return {"property": property_name, "url": {"equals": value}}
+        if prop_type == "number":
+            try:
+                num_value = float(value)
+            except ValueError:
+                return None
+            return {"property": property_name, "number": {"equals": num_value}}
+        return None
+
+    def _build_not_empty_filter(self, property_name: str) -> Optional[Dict[str, Any]]:
+        prop_type = self._property_type(property_name)
+        if not prop_type:
+            return None
+        if prop_type in {"title", "rich_text", "select", "multi_select", "status", "people", "files", "relation", "date", "url", "email", "phone_number"}:
+            return {"property": property_name, prop_type: {"is_not_empty": True}}
+        if prop_type == "number":
+            return {"property": property_name, "number": {"is_not_empty": True}}
+        return None
 
     def _find_existing_by_txid(self, txid: str) -> Optional[str]:
         # Filter on the Title property "TXID"
@@ -245,13 +301,27 @@ class NotionLogger:
         exchange_value: Optional[str] = None,
     ) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
         cursor: Optional[str] = None
+        base_filters: List[Dict[str, Any]] = []
+        if exchange_property and exchange_value:
+            exch_filter = self._build_equals_filter(exchange_property, exchange_value)
+            if exch_filter:
+                base_filters.append(exch_filter)
+        pair_not_empty = self._build_not_empty_filter(pair_property)
+        if pair_not_empty:
+            base_filters.append(pair_not_empty)
         while True:
+            query_payload: Dict[str, Any] = {
+                "database_id": self.db_id,
+                "start_cursor": cursor,
+                "page_size": 100,
+            }
+            if base_filters:
+                if len(base_filters) == 1:
+                    query_payload["filter"] = base_filters[0]
+                else:
+                    query_payload["filter"] = {"and": base_filters}
             resp = self.notion.databases.query(
-                **{
-                    "database_id": self.db_id,
-                    "start_cursor": cursor,
-                    "page_size": 100,
-                }
+                **query_payload
             )
             results = resp.get("results", [])
             for page in results:
